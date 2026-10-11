@@ -1179,9 +1179,82 @@ def _dvr_ffmpeg_retry_backoff_seconds(retry_index):
     return min(0.25 * retry_index, 3.0)
 
 
+_DVR_FINALIZE_MODES = ("mkv", "hls+mkv", "hls")
+
+
+def _dvr_finalize_mode():
+    """How a finished recording is stored, from ``DISPATCHARR_DVR_FINALIZE``.
+
+    - ``mkv`` (default): concat the HLS segments into an MKV, then delete the
+      HLS directory once no viewer has fetched a segment for 20 seconds.
+    - ``hls+mkv``: write the MKV but keep the HLS directory, so the playlist a
+      viewer opened while the recording was live stays valid after it ends.
+    - ``hls``: skip the MKV; the HLS playlist is the recording.
+
+    Both ``hls`` modes append ``#EXT-X-ENDLIST`` to the playlist when the
+    recording finishes, which turns it into a complete VOD timeline at the
+    same URL.
+    """
+    mode = os.environ.get("DISPATCHARR_DVR_FINALIZE", "mkv").strip().lower()
+    return mode if mode in _DVR_FINALIZE_MODES else "mkv"
+
+
+def _dvr_keep_hls():
+    return _dvr_finalize_mode() != "mkv"
+
+
+def _dvr_transcode_audio():
+    """Re-encode recorded audio to AAC-LC when ``DISPATCHARR_DVR_AUDIO=aac``.
+
+    Some sources send HE-AAC with an ADTS header that declares AAC Main.
+    Browsers that build their decoder config from that header reject the
+    stream, so a re-encode is the reliable way to make it playable.
+    """
+    return os.environ.get("DISPATCHARR_DVR_AUDIO", "copy").strip().lower() == "aac"
+
+
+def _dvr_hls_write_endlist(m3u8_path):
+    """Append ``#EXT-X-ENDLIST`` to a finished recording's playlist.
+
+    Writes a temporary file and renames it over the playlist, so a viewer
+    polling the playlist never reads a partial file.  Returns True when the
+    playlist ends with ENDLIST afterwards.
+    """
+    if not m3u8_path or not os.path.exists(m3u8_path):
+        return False
+    try:
+        with open(m3u8_path) as _f:
+            body = _f.read()
+        if "#EXT-X-ENDLIST" in body:
+            return True
+        if body and not body.endswith("\n"):
+            body += "\n"
+        tmp_path = f"{m3u8_path}.endlist.tmp"
+        with open(tmp_path, "w") as _f:
+            _f.write(body + "#EXT-X-ENDLIST\n")
+        os.replace(tmp_path, m3u8_path)
+        return True
+    except Exception as e:
+        logger.warning(f"Failed to finalize HLS playlist {m3u8_path}: {e}")
+        return False
+
+
 def _dvr_build_ffmpeg_cmd(stream_url, recording_id, hls_m3u8, hls_seg_pattern, hls_start_number):
     """Build the FFmpeg command for DVR HLS segment recording."""
     from core.utils import dispatcharr_dvr_user_agent
+    if _dvr_transcode_audio():
+        # aresample=async=1 fills gaps in lossy source audio with silence so
+        # the re-encoded track stays aligned with the copied video.
+        codec_args = [
+            "-c:v", "copy",
+            "-af", "aresample=async=1",
+            "-c:a", "aac", "-b:a", "160k", "-ac", "2",
+        ]
+    else:
+        codec_args = ["-c", "copy"]
+    # An EVENT playlist tells players the timeline only grows, so they keep
+    # every segment seekable instead of treating it as a sliding live window.
+    playlist_type_args = ["-hls_playlist_type", "event"] if _dvr_keep_hls() else []
     return [
         "ffmpeg", "-y",
         "-reconnect", "1",
@@ -1194,13 +1267,14 @@ def _dvr_build_ffmpeg_cmd(stream_url, recording_id, hls_m3u8, hls_seg_pattern, h
         # Tolerate minor TS corruption without aborting the whole process.
         "-err_detect", "ignore_err",
         "-i", stream_url,
-        "-c", "copy",
+        *codec_args,
         # Shift output timestamps so they start from 0, fixing negative PTS
         # values that can prevent segment boundary detection in the HLS muxer.
         "-avoid_negative_ts", "make_zero",
         "-f", "hls",
         "-hls_time", "4",
         "-hls_list_size", "0",
+        *playlist_type_args,
         "-hls_flags", "append_list+omit_endlist+independent_segments",
         "-start_number", str(hls_start_number),
         "-hls_segment_filename", hls_seg_pattern,
@@ -2087,6 +2161,13 @@ def run_recording(recording_id, channel_id, start_time_str, end_time_str):
     # --- Post-processing: concat HLS segments → final MKV ---
     remux_success = False
     hls_m3u8 = os.path.join(hls_dir, "index.m3u8") if hls_dir else None
+    finalize_mode = _dvr_finalize_mode()
+    keep_hls = finalize_mode != "mkv"
+    if keep_hls and hls_m3u8:
+        # Close the timeline before the (slow) MKV concat, so a viewer sees the
+        # recording end at the same URL it has been playing.
+        if _dvr_hls_write_endlist(hls_m3u8):
+            logger.info(f"DVR recording {recording_id}: HLS playlist finalized in place ({finalize_mode})")
 
     def _get_hls_segments(m3u8_path, seg_dir):
         """Return ordered segment paths from an HLS m3u8 playlist."""
@@ -2119,7 +2200,7 @@ def run_recording(recording_id, channel_id, start_time_str, end_time_str):
         except Exception:
             segments = []
 
-    if segments:
+    if segments and finalize_mode != "hls":
         concat_list_path = os.path.join(hls_dir, "concat.txt")
         try:
             with open(concat_list_path, "w") as _cl:
@@ -2240,53 +2321,56 @@ def run_recording(recording_id, channel_id, start_time_str, end_time_str):
                         _pre_rmtree_rec.save(update_fields=["custom_properties"])
                 except Exception as _pre_e:
                     logger.warning(f"DVR recording {recording_id}: pre-rmtree DB update failed: {_pre_e}")
-                # Wait for active HLS viewers to finish downloading segments
-                # before deleting the directory.  The hls endpoint refreshes
-                # _hls_viewer_key on every .ts request with a 20s TTL, so the
-                # key expiring naturally means no segment was fetched in the
-                # last 20 seconds (client has stopped).  We loop until the key
-                # is gone with a 4-hour hard safety cap in case Redis gets stuck.
-                _viewer_wait_start = time.time()
-                _safety_timeout = 14400  # 4 hours absolute maximum
-                try:
-                    from core.utils import RedisClient as _RC
-                    _rv = _RC.get_client(max_retries=1, retry_interval=0)
-                    if _rv and _rv.exists(_hls_viewer_key):
-                        logger.info(
-                            f"DVR recording {recording_id}: active HLS viewer detected, "
-                            f"deferring HLS directory cleanup until client disconnects"
-                        )
-                        while _rv.exists(_hls_viewer_key):
-                            if time.time() - _viewer_wait_start > _safety_timeout:
-                                logger.warning(
-                                    f"DVR recording {recording_id}: viewer wait safety timeout "
-                                    f"({_safety_timeout}s) reached, proceeding with HLS directory cleanup"
-                                )
-                                break
-                            time.sleep(2)
-                        logger.info(
-                            f"DVR recording {recording_id}: viewer wait complete after "
-                            f"{time.time() - _viewer_wait_start:.1f}s"
-                        )
-                except Exception as _ve:
-                    logger.debug(f"DVR recording {recording_id}: viewer wait check failed: {_ve}")
-                try:
-                    shutil.rmtree(hls_dir)
-                    logger.debug(f"Cleaned up HLS directory: {hls_dir}")
-                except Exception as _e:
-                    logger.warning(f"Failed to remove HLS directory {hls_dir}: {_e}")
-                # Now that the HLS dir is gone, clear _hls_dir from custom_properties
-                # so the hls endpoint will redirect (.m3u8) or 404 (.ts) cleanly.
-                try:
-                    _post_rmtree_rec = Recording.objects.filter(id=recording_id).first()
-                    if _post_rmtree_rec:
-                        _post_rmtree_cp = _post_rmtree_rec.custom_properties or {}
-                        if "_hls_dir" in _post_rmtree_cp:
-                            _post_rmtree_cp.pop("_hls_dir", None)
-                            _post_rmtree_rec.custom_properties = _post_rmtree_cp
-                            _post_rmtree_rec.save(update_fields=["custom_properties"])
-                except Exception as _post_e:
-                    logger.warning(f"DVR recording {recording_id}: post-rmtree DB update failed: {_post_e}")
+                # In the hls modes the directory is the playable timeline, so
+                # it outlives the MKV instead of being deleted here.
+                if not keep_hls:
+                    # Wait for active HLS viewers to finish downloading segments
+                    # before deleting the directory.  The hls endpoint refreshes
+                    # _hls_viewer_key on every .ts request with a 20s TTL, so the
+                    # key expiring naturally means no segment was fetched in the
+                    # last 20 seconds (client has stopped).  We loop until the key
+                    # is gone with a 4-hour hard safety cap in case Redis gets stuck.
+                    _viewer_wait_start = time.time()
+                    _safety_timeout = 14400  # 4 hours absolute maximum
+                    try:
+                        from core.utils import RedisClient as _RC
+                        _rv = _RC.get_client(max_retries=1, retry_interval=0)
+                        if _rv and _rv.exists(_hls_viewer_key):
+                            logger.info(
+                                f"DVR recording {recording_id}: active HLS viewer detected, "
+                                f"deferring HLS directory cleanup until client disconnects"
+                            )
+                            while _rv.exists(_hls_viewer_key):
+                                if time.time() - _viewer_wait_start > _safety_timeout:
+                                    logger.warning(
+                                        f"DVR recording {recording_id}: viewer wait safety timeout "
+                                        f"({_safety_timeout}s) reached, proceeding with HLS directory cleanup"
+                                    )
+                                    break
+                                time.sleep(2)
+                            logger.info(
+                                f"DVR recording {recording_id}: viewer wait complete after "
+                                f"{time.time() - _viewer_wait_start:.1f}s"
+                            )
+                    except Exception as _ve:
+                        logger.debug(f"DVR recording {recording_id}: viewer wait check failed: {_ve}")
+                    try:
+                        shutil.rmtree(hls_dir)
+                        logger.debug(f"Cleaned up HLS directory: {hls_dir}")
+                    except Exception as _e:
+                        logger.warning(f"Failed to remove HLS directory {hls_dir}: {_e}")
+                    # Now that the HLS dir is gone, clear _hls_dir from custom_properties
+                    # so the hls endpoint will redirect (.m3u8) or 404 (.ts) cleanly.
+                    try:
+                        _post_rmtree_rec = Recording.objects.filter(id=recording_id).first()
+                        if _post_rmtree_rec:
+                            _post_rmtree_cp = _post_rmtree_rec.custom_properties or {}
+                            if "_hls_dir" in _post_rmtree_cp:
+                                _post_rmtree_cp.pop("_hls_dir", None)
+                                _post_rmtree_rec.custom_properties = _post_rmtree_cp
+                                _post_rmtree_rec.save(update_fields=["custom_properties"])
+                    except Exception as _post_e:
+                        logger.warning(f"DVR recording {recording_id}: post-rmtree DB update failed: {_post_e}")
             else:
                 logger.error(
                     f"DVR recording {recording_id}: all HLS\u2192MKV concat attempts "
@@ -2301,6 +2385,8 @@ def run_recording(recording_id, channel_id, start_time_str, end_time_str):
                 os.remove(concat_list_path)
             except OSError:
                 pass
+    elif segments:
+        logger.info(f"DVR recording {recording_id}: DISPATCHARR_DVR_FINALIZE=hls, skipping MKV concat")
     else:
         logger.warning(f"DVR recording {recording_id}: no HLS segments found. Nothing to concat")
 
@@ -2575,7 +2661,16 @@ def recover_recordings_on_startup():
                 hls_dir_path = cp.get("_hls_dir")
                 mkv_path = cp.get("file_path")
 
-                if hls_dir_path and os.path.isdir(hls_dir_path) and mkv_path:
+                _finalize_mode = _dvr_finalize_mode()
+                if _finalize_mode != "mkv" and hls_dir_path and os.path.isdir(hls_dir_path):
+                    _dvr_hls_write_endlist(os.path.join(hls_dir_path, "index.m3u8"))
+
+                if _finalize_mode == "hls" and hls_dir_path and os.path.isdir(hls_dir_path):
+                    # The HLS playlist is the recording; there is nothing to concat.
+                    cp["status"] = "interrupted"
+                    cp["interrupted_reason"] = "server_restarted_after_end"
+                    cp["remux_success"] = False
+                elif hls_dir_path and os.path.isdir(hls_dir_path) and mkv_path:
                     # Parse m3u8 for ordered segment list; fall back to sorted filenames
                     _m3u8 = os.path.join(hls_dir_path, "index.m3u8")
                     _segs = []
@@ -2617,10 +2712,11 @@ def recover_recordings_on_startup():
                                 cp["status"] = "interrupted"
                                 cp["interrupted_reason"] = "server_restarted_after_end"
                                 cp["remux_success"] = True
-                                try:
-                                    shutil.rmtree(hls_dir_path)
-                                except OSError:
-                                    pass
+                                if _finalize_mode == "mkv":
+                                    try:
+                                        shutil.rmtree(hls_dir_path)
+                                    except OSError:
+                                        pass
                                 logger.info(
                                     f"recover_recordings_on_startup: recording {rec.id} HLS\u2192MKV concat succeeded"
                                 )

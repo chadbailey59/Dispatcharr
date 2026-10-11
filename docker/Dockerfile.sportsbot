@@ -1,0 +1,12 @@
+# Sportsbot build of Dispatcharr: the released v0.27.0 image with this
+# branch's patched Python files layered on top. Pinning the base by digest
+# keeps every dependency identical to the image it replaces, so the only
+# difference is the patch. Rebuild from docker/Dockerfile when moving to a
+# newer upstream release.
+FROM ghcr.io/dispatcharr/dispatcharr@sha256:425129020764037869c7d1a2e74ba57ca640cb5d551ef57d869b745b6ea71c7b
+
+COPY apps/channels/tasks.py /app/apps/channels/tasks.py
+COPY apps/channels/tests/test_recording_keep_hls.py /app/apps/channels/tests/test_recording_keep_hls.py
+
+LABEL org.opencontainers.image.source="https://github.com/chadbailey59/Dispatcharr" \
+      org.opencontainers.image.version="0.27.0-sportsbot.1"
